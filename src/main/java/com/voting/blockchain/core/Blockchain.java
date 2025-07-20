@@ -1,4 +1,12 @@
 package com.voting.blockchain.core;
+import com.voting.blockchain.util.CryptoUtil;
+import java.security.InvalidKeyException;
+import java.security.NoSuchAlgorithmException;
+import java.security.PublicKey;
+import java.security.SignatureException;
+import java.security.spec.InvalidKeySpecException;
+
+
 import java.io.IOException;
 import com.fasterxml.jackson.databind.JsonMappingException;
 
@@ -108,7 +116,7 @@ public class Blockchain {
 
     private void createGenesisBlock() {
         List<VoteTransaction> genesisData = new ArrayList<>();
-        genesisData.add(new VoteTransaction("system", "genesis_block_creation"));
+        genesisData.add(new VoteTransaction("system", "genesis_block_creation" , "",""));
         Block genesisBlock = new Block(0, "0", genesisData);
         mineBlock(genesisBlock);
         chain.add(genesisBlock);

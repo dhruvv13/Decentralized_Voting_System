@@ -1,29 +1,41 @@
 // src/main/java/com/voting/blockchain/controller/BlockchainController.java
-package com.voting.blockchain.controller; // This must be the first line
+package com.voting.blockchain.controller;
 
-import com.voting.blockchain.core.Blockchain; // Import from core package
-import com.voting.blockchain.model.Block; // Import from model package
-import com.voting.blockchain.model.VoteTransaction; // Import from model package
+import com.voting.blockchain.core.Blockchain;
+import com.voting.blockchain.model.Block;
+import com.voting.blockchain.model.VoteTransaction;
+import com.voting.blockchain.service.FirebaseAuthenticationService;
+import com.voting.blockchain.util.CryptoUtil;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.userdetails.UserDetails; // NEW: Import UserDetails (CRUCIAL FIX)
+import com.google.firebase.auth.FirebaseAuthException;
 
+import java.security.KeyPair;
+import java.security.NoSuchAlgorithmException;
+import java.security.InvalidKeyException;
+import java.security.SignatureException;
+import java.security.spec.InvalidKeySpecException;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-@RestController // Marks this class as a Spring REST Controller
-@RequestMapping("/api/v1") // Base path for all endpoints in this controller
+@RestController
+@RequestMapping("/api/v1")
 public class BlockchainController {
 
-    private final Blockchain blockchain; // Inject our Blockchain core component
+    private final Blockchain blockchain;
+    private final FirebaseAuthenticationService firebaseAuthService;
 
-    // Spring's @Autowired handles injecting the Blockchain instance
     @Autowired
-    public BlockchainController(Blockchain blockchain) {
+    public BlockchainController(Blockchain blockchain, FirebaseAuthenticationService firebaseAuthService) {
         this.blockchain = blockchain;
+        this.firebaseAuthService = firebaseAuthService;
     }
 
     /**
@@ -41,24 +53,94 @@ public class BlockchainController {
     }
 
     /**
-     * Endpoint to add a new vote transaction.
-     * POST /api/v1/transactions/new
-     * Request Body: { "voterId": "...", "candidateId": "..." }
-     * @param transaction The vote transaction to add
-     * @return Confirmation message
+     * Endpoint to generate a new RSA cryptographic key pair.
+     * FOR TESTING/DEMO PURPOSES ONLY. In a real application, private keys
+     * are generated and securely stored client-side, never transmitted.
+     * GET /api/v1/generateKeys
+     * @return A map containing encoded public and private keys.
      */
-    @PostMapping("/transactions/new")
-    public ResponseEntity<Map<String, String>> newTransaction(@RequestBody VoteTransaction transaction) {
-        if (transaction == null || transaction.getVoterId() == null || transaction.getCandidateId() == null) {
-            return ResponseEntity.badRequest().body(Collections.singletonMap("message", "Invalid transaction data. Voter ID and Candidate ID are required."));
+    @GetMapping("/generateKeys")
+    public ResponseEntity<Map<String, String>> generateKeyPair() {
+        try {
+            KeyPair keyPair = CryptoUtil.generateKeyPair();
+            String publicKey = CryptoUtil.encodePublicKey(keyPair.getPublic());
+            String privateKey = CryptoUtil.encodePrivateKey(keyPair.getPrivate());
+
+            Map<String, String> keys = new HashMap<>();
+            keys.put("publicKey", publicKey);
+            keys.put("privateKey", privateKey); // WARNING: Never expose private key in real app!
+            keys.put("message", "Generated key pair. Keep your privateKey secret!");
+
+            return ResponseEntity.ok(keys);
+        } catch (NoSuchAlgorithmException e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Collections.singletonMap("error", "Key generation failed: " + e.getMessage()));
+        }
+    }
+
+    // TEMPORARILY COMMENTED OUT THIS METHOD TO RESOLVE COMPILATION ERROR
+    /*
+    @PostMapping("/transactions/register")
+    public ResponseEntity<Map<String, String>> registerUser(@RequestBody Map<String, String> registrationRequest) {
+        String email = registrationRequest.get("email");
+        String password = registrationRequest.get("password");
+
+        if (email == null || password == null || email.isEmpty() || password.isEmpty()) {
+            return ResponseEntity.badRequest().body(Collections.singletonMap("message", "Email and password are required."));
         }
 
         try {
-            blockchain.addTransaction(transaction);
+            String uid = firebaseAuthService.createUser(email, password);
             return ResponseEntity.status(HttpStatus.CREATED)
-                    .body(Collections.singletonMap("message", "Transaction will be added to Block " + (blockchain.getChain().size() + 1)));
+                                 .body(Collections.singletonMap("message", "User registered successfully. UID: " + uid));
+        } catch (FirebaseAuthException e) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                                 .body(Collections.singletonMap("error", "Firebase Auth Error: " + e.getMessage()));
+        }
+    }
+    */
+
+    /**
+     * Endpoint to add a new vote transaction.
+     * Voter ID is now taken from the authenticated Firebase user's UID.
+     * This endpoint requires authentication (Authorization: Bearer <Firebase_ID_Token>).
+     * POST /api/v1/transactions/new
+     * Request Body: { "candidateId": "...", "senderPublicKey": "...", "signature": "..." }
+     * @param transactionRequest The request containing candidate ID, public key, and signature
+     * @return Confirmation message
+     */
+    @PostMapping("/transactions/new")
+    public ResponseEntity<Map<String, String>> newTransaction(@RequestBody Map<String, String> transactionRequest) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        if (authentication == null || !authentication.isAuthenticated() || "anonymousUser".equals(authentication.getPrincipal())) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(Collections.singletonMap("message", "Authentication required to cast a vote."));
+        }
+
+        // --- FIX FOR ClassCastException (CRUCIAL) ---
+        UserDetails userDetails = (UserDetails) authentication.getPrincipal(); // Correctly cast to UserDetails
+        String voterId = userDetails.getUsername(); // Get the UID from the UserDetails object's username property
+        // --- END FIX ---
+
+        String candidateId = transactionRequest.get("candidateId");
+        String senderPublicKey = transactionRequest.get("senderPublicKey");
+        String signature = transactionRequest.get("signature");
+
+        if (candidateId == null || candidateId.isEmpty() ||
+                senderPublicKey == null || senderPublicKey.isEmpty() ||
+                signature == null || signature.isEmpty()) {
+            return ResponseEntity.badRequest().body(Collections.singletonMap("message", "Candidate ID, senderPublicKey, and signature are required."));
+        }
+
+        // Create the VoteTransaction with the authenticated voterId AND signature data
+        VoteTransaction transaction = new VoteTransaction(voterId, candidateId, senderPublicKey, signature);
+
+        try {
+            blockchain.addTransaction(transaction); // This will now verify the signature
+            return ResponseEntity.status(HttpStatus.CREATED)
+                    .body(Collections.singletonMap("message", "Transaction will be added to Block " + (blockchain.getChain().size() + 1) + " by voter: " + voterId));
         } catch (IllegalArgumentException e) {
-            return ResponseEntity.badRequest().body(Collections.singletonMap("message", e.getMessage()));
+            return ResponseEntity.badRequest().body(Collections.singletonMap("message", "Transaction verification failed: " + e.getMessage()));
         }
     }
 
